@@ -22,7 +22,15 @@ const state = {
   labelW: 110,
   timeMax: 1000,
   evalInflight: false,
-  lastEvalTime: null,
+  // Bumped on every project-data change (project switch / successful
+  // create-update-delete).  An eval result is reusable only while both the
+  // project and this generation match the request it came from — the same
+  // playhead instant in a different project or after an edit needs a fresh
+  // /eval, never a cached readout taken from the old data.
+  evalGen: 0,
+  // cache key of the readouts currently shown: `${projectId}|${gen}|${time}`;
+  // null means no readout may be reused yet (e.g. current eval failed)
+  readoutKey: null,
   dragging: false,
 };
 
@@ -108,11 +116,19 @@ async function loadProjects(selectId) {
 }
 
 async function openProject(id) {
+  // invalidate any eval belonging to the previously open project: a
+  // response still in flight must be discarded rather than shown here
   state.projectId = id;
+  state.evalGen += 1;
   localStorage.setItem("lightsProject", id);
   state.project = await api(`/api/projects/${id}`);
   state.selectedId = null;
   buildLanes();
+  // clear readouts from the old project before re-evaluating so switching
+  // to an empty project leaves no stale channels on screen
+  state.readouts = null;
+  state.readoutKey = null;
+  renderReadouts();
   renderTimeline();
   renderEditor();
   await requestEval(true);
@@ -383,13 +399,22 @@ async function requestEval(immediate) {
   // value; send it verbatim — no rounding anywhere in the chain, so the
   // readout always matches a direct /eval call for this exact instant
   const tq = state.time;
-  // identical time -> the result would be the same
-  if (state.lastEvalTime === tq && state.readouts) return;
-  // one in-flight request at a time; remember to re-run afterwards
+  const pid = state.projectId;
+  const gen = state.evalGen;
+  // Cache is reusable only for the exact same project + data generation +
+  // instant.  Same time after a project switch or a successful edit bumps
+  // the generation, so the old readout can never be served again.
+  const key = `${pid}|${gen}|${tq}`;
+  // one in-flight request at a time; remember to re-run afterwards (the
+  // re-run re-reads project/gen/time so it always evaluates the current
+  // data, even if it changed while the request was in flight).  This must
+  // precede cache reuse: a same-key response still in flight may belong to
+  // stale data, and the queued re-run is what replaces it.
   if (state.evalInflight) {
     state.evalQueued = true;
     return;
   }
+  if (state.readoutKey === key) return;
   // during playback, cap request rate to ~12/s; seeks / pause are always
   // immediate.  A skipped frame schedules one trailing run so the readout
   // eventually settles on the exact current instant.
@@ -406,13 +431,45 @@ async function requestEval(immediate) {
   state._lastEvalKick = now;
 
   state.evalInflight = true;
-  state.lastEvalTime = tq;
   try {
-    state.readouts = await api(
-      `/api/projects/${state.projectId}/eval?t=${encodeURIComponent(String(tq))}`);
+    const data = await api(
+      `/api/projects/${pid}/eval?t=${encodeURIComponent(String(tq))}`);
+    // stale response guard: the project was switched or the data changed
+    // while the request was in flight.  Never overwrite the current view;
+    // queue a re-run only if nothing already covers the current instant,
+    // so the current data is evaluated without redundant requests.
+    if (pid !== state.projectId || gen !== state.evalGen) {
+      if (state.readoutKey !==
+          `${state.projectId}|${state.evalGen}|${state.time}`) {
+        state.evalQueued = true;
+      }
+      return;
+    }
+    state.readouts = data;
+    state.readoutKey = key;
     renderReadouts();
   } catch (e) {
-    toast(e.message);
+    // only the request for the current project/data may touch the display;
+    // a stale failure must not wipe readouts belonging to a newer context
+    if (pid === state.projectId && gen === state.evalGen) {
+      // current project can't be evaluated: drop the stale readout (its
+      // channels may no longer exist) and surface the error; readoutKey
+      // stays null so a later retry is not deduped away
+      state.readouts = null;
+      state.readoutKey = null;
+      renderReadouts();
+      toast(e.message);
+    }
+    // A stale failure or success leaves the current instant unaccounted
+    // for unless a newer eval of the live context is already in flight or
+    // its result is cached; the shared finally block only re-runs when
+    // something got queued, so ask it here.
+    if ((pid !== state.projectId || gen !== state.evalGen) &&
+        !state.evalQueued &&
+        state.readoutKey !==
+        `${state.projectId}|${state.evalGen}|${state.time}`) {
+      state.evalQueued = true;
+    }
   } finally {
     state.evalInflight = false;
     if (state.evalQueued) {
@@ -687,10 +744,18 @@ async function deleteItem(id) {
 
 async function applyProjectPayload(payload) {
   state.project = payload;
+  // the data changed: invalidate any cached / in-flight eval for the old
+  // data so the same playhead instant is re-evaluated against this project
+  state.evalGen += 1;
   const focus = payload.focus_item_id;
   state.selectedId = focus ?? state.selectedId;
   if (state.selectedId != null && !itemById(state.selectedId)) state.selectedId = null;
   buildLanes();
+  // channels can disappear (e.g. deleting the last item of a fixture);
+  // drop the old readout now so removed channels can't linger
+  state.readouts = null;
+  state.readoutKey = null;
+  renderReadouts();
   renderTimeline();
   renderEditor();
   await requestEval(true);
