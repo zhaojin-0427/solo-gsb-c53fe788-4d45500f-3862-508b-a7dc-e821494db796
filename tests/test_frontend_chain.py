@@ -74,5 +74,72 @@ class TestPlayheadPrecisionChain(unittest.TestCase):
         self.assertIn("requestEval(true)", trail.group(1))
 
 
+class TestEvalCacheInvalidation(unittest.TestCase):
+    """Static guards for the stale-readout fix.
+
+    The /eval cache is keyed by project + data revision + exact instant:
+    a same-instant request after a project switch or an item save/delete
+    must re-hit ``GET /api/projects/{id}/eval?t=``, an in-flight response
+    from a superseded context must be dropped (never overwrite newer
+    state), and a failed evaluation of the current project must clear the
+    old readouts and surface the error.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = APP_JS.read_text(encoding="utf-8")
+        cls.flat = re.sub(r"\s+", " ", cls.src)
+
+    def test_cache_context_combines_project_and_revision(self):
+        body = function_body(self.src, "function evalCtx()")
+        self.assertIn("state.projectId", body)
+        self.assertIn("state.dataVersion", body)
+
+    def test_dedup_requires_same_context_and_time(self):
+        # time-only dedup was the bug: the context must match too
+        body = function_body(self.src, "async function requestEval(immediate)")
+        self.assertIn("state.lastEvalCtx === ctx", body)
+        self.assertIn("state.lastEvalTime === tq", body)
+
+    def test_open_project_bumps_revision_and_clears_readouts(self):
+        body = function_body(self.src, "async function openProject(id)")
+        self.assertIn("state.dataVersion += 1", body)
+        # old channel readouts are cleared before the fresh evaluation,
+        # so switching to an empty project shows no stale channels
+        self.assertLess(body.index("state.readouts = null"),
+                        body.index("requestEval(true)"))
+        self.assertIn("renderReadouts()", body)
+
+    def test_apply_payload_bumps_revision_and_reevaluates(self):
+        body = function_body(self.src,
+                             "async function applyProjectPayload(payload)")
+        self.assertIn("state.dataVersion += 1", body)
+        self.assertIn("requestEval(true)", body)
+
+    def test_stale_inflight_response_is_discarded(self):
+        body = function_body(self.src, "async function requestEval(immediate)")
+        # the staleness guard must run before the response is stored
+        self.assertLess(body.index("ctx !== evalCtx()"),
+                        body.index("state.readouts = data"))
+
+    def test_eval_failure_clears_readouts_and_toasts(self):
+        body = function_body(self.src, "async function requestEval(immediate)")
+        catch = body.split("} catch (e) {", 1)[1]
+        self.assertIn("state.readouts = null", catch)
+        self.assertIn("renderReadouts()", catch)
+        self.assertIn("toast(e.message)", catch)
+
+    def test_save_failure_keeps_readouts(self):
+        # a rejected save must leave the previous readouts untouched
+        body = function_body(self.src,
+                             "async function saveForm(form, isEdit, errBox)")
+        self.assertNotIn("state.readouts", body)
+
+    def test_eval_url_keeps_project_path_and_verbatim_time(self):
+        self.assertIn(
+            "/api/projects/${state.projectId}/eval"
+            "?t=${encodeURIComponent(String(tq))}", self.src)
+
+
 if __name__ == "__main__":
     unittest.main()

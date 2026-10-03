@@ -22,7 +22,10 @@ const state = {
   labelW: 110,
   timeMax: 1000,
   evalInflight: false,
-  lastEvalTime: null,
+  evalQueued: false,
+  lastEvalTime: null,     // verbatim playhead of the last issued /eval request
+  lastEvalCtx: null,      // cache context (project + data revision) of that request
+  dataVersion: 0,         // bumped whenever the open project's data is replaced
   dragging: false,
 };
 
@@ -112,6 +115,12 @@ async function openProject(id) {
   localStorage.setItem("lightsProject", id);
   state.project = await api(`/api/projects/${id}`);
   state.selectedId = null;
+  // a different project is a different cache context: drop the previous
+  // project's readouts right away (an empty project must show no channel
+  // readouts at all), then re-evaluate this project at the current instant
+  state.dataVersion += 1;
+  state.readouts = null;
+  renderReadouts();
   buildLanes();
   renderTimeline();
   renderEditor();
@@ -378,13 +387,23 @@ function updateClockAndHead() {
   line.setAttribute("y2", h);
 }
 
+// Cache context for /eval: which project and which revision of its data.
+// openProject / applyProjectPayload bump state.dataVersion, so after a
+// project switch or a successful item save/delete the context changes and
+// a same-instant request is re-evaluated instead of served from cache.
+function evalCtx() {
+  return `${state.projectId}#${state.dataVersion}`;
+}
+
 async function requestEval(immediate) {
   // the playhead is an arbitrary non-negative (possibly fractional) ms
   // value; send it verbatim — no rounding anywhere in the chain, so the
   // readout always matches a direct /eval call for this exact instant
   const tq = state.time;
-  // identical time -> the result would be the same
-  if (state.lastEvalTime === tq && state.readouts) return;
+  const ctx = evalCtx();
+  // the cached readouts are reusable only for the same project revision
+  // AND the same instant — identical context + time -> same result
+  if (state.lastEvalCtx === ctx && state.lastEvalTime === tq && state.readouts) return;
   // one in-flight request at a time; remember to re-run afterwards
   if (state.evalInflight) {
     state.evalQueued = true;
@@ -406,13 +425,25 @@ async function requestEval(immediate) {
   state._lastEvalKick = now;
 
   state.evalInflight = true;
+  state.lastEvalCtx = ctx;
   state.lastEvalTime = tq;
   try {
-    state.readouts = await api(
+    const data = await api(
       `/api/projects/${state.projectId}/eval?t=${encodeURIComponent(String(tq))}`);
+    // the project was switched or its data changed while this request was
+    // in flight: the response is stale — drop it, never let it overwrite
+    // newer state; the queued re-run below fetches the live context
+    if (ctx !== evalCtx()) return;
+    state.readouts = data;
     renderReadouts();
   } catch (e) {
-    toast(e.message);
+    // a failed evaluation of the *current* project must clear the old
+    // readouts and surface the error; a stale request's failure is moot
+    if (ctx === evalCtx()) {
+      state.readouts = null;
+      renderReadouts();
+      toast(e.message);
+    }
   } finally {
     state.evalInflight = false;
     if (state.evalQueued) {
@@ -687,6 +718,9 @@ async function deleteItem(id) {
 
 async function applyProjectPayload(payload) {
   state.project = payload;
+  // the items changed: bump the cache context so the readouts at the
+  // current instant are re-evaluated instead of reused from cache
+  state.dataVersion += 1;
   const focus = payload.focus_item_id;
   state.selectedId = focus ?? state.selectedId;
   if (state.selectedId != null && !itemById(state.selectedId)) state.selectedId = null;
